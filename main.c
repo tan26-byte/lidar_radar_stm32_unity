@@ -21,7 +21,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "stdio.h"
+#include <stdio.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -41,48 +42,126 @@
 
 /* Private variables ---------------------------------------------------------*/
 UART_HandleTypeDef huart1;
+UART_HandleTypeDef huart2;
 UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
+uint8_t radar_rx;
+uint8_t radar_buf[20];
+uint8_t radar_idx = 0;
+uint8_t radar_ready = 0;
+
 uint8_t lidar_rx;
+uint8_t lidar_buf[5];
+uint8_t lidar_packet[5];
+uint8_t lidar_idx = 0;
+uint8_t lidar_ready = 0;
+
+uint8_t byte;
+uint8_t prev_radar = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART1_UART_Init(void);
+static void MX_USART2_UART_Init(void);
 static void MX_USART3_UART_Init(void);
 /* USER CODE BEGIN PFP */
+void process_lidar(void)
+{
+    uint8_t *d = lidar_packet;
 
-/* USER CODE END PFP */
+    uint16_t angle_raw = ((d[2] << 8) | d[1]) >> 1;
+    float angle = angle_raw / 64.0;
 
-/* Private user code ---------------------------------------------------------*/
-/* USER CODE BEGIN 0 */
+    uint16_t dist = (d[4] << 8) | d[3];
+
+    if (dist == 0) return;
+
+    // Reduce spam (IMPORTANT)
+    static int skip = 0;
+    skip++;
+    if (skip % 20 != 0) return;
+
+    printf("LIDAR:%.1f,%d\r\n", angle, dist);
+}
+
+void process_radar(void)
+{
+    uint16_t dist[8];
+
+    for (int i = 0; i < 8; i++)
+    {
+        dist[i] = (radar_buf[2 + i*2] << 8) | radar_buf[3 + i*2];
+
+        if (dist[i] == 0xFFFF)
+            dist[i] = 0;
+    }
+
+    printf("RADAR:");
+
+    for (int i = 0; i < 8; i++)
+    {
+        printf("%d", dist[i]);
+        if (i < 7) printf(",");
+    }
+
+    printf("\r\n");
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+	if (huart->Instance == USART2)
+	    {
+	        if (prev_radar == 0x54 && radar_rx == 0x48)
+	        {
+	            radar_idx = 0;
+	            radar_buf[radar_idx++] = 0x54;
+	            radar_buf[radar_idx++] = 0x48;
+	        }
+	        else if (radar_idx > 0 && radar_idx < 20)
+	        {
+	            radar_buf[radar_idx++] = radar_rx;
+
+	            if (radar_idx == 20)
+	            {
+	                radar_ready = 1;
+	                radar_idx = 0;
+	            }
+	        }
+
+	        prev_radar = radar_rx;
+
+	        HAL_UART_Receive_IT(&huart2, &radar_rx, 1);
+	    }
+
+	    // -------- LIDAR (USART3) --------
+	    if (huart->Instance == USART3)
+	    {
+	        lidar_buf[lidar_idx++] = lidar_rx;
+
+	        if (lidar_idx == 5)
+	        {
+	            memcpy(lidar_packet, lidar_buf, 5);
+	            lidar_ready = 1;
+	            lidar_idx = 0;
+	        }
+
+	        HAL_UART_Receive_IT(&huart3, &lidar_rx, 1);
+	    }
+}
+
 int _write(int file, char *ptr, int len)
 {
     HAL_UART_Transmit(&huart1, (uint8_t*)ptr, len, HAL_MAX_DELAY);
     return len;
 }
+/* USER CODE END PFP */
 
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
-{
-    if (huart->Instance == USART3)
-    {
-        // Print byte as HEX
-        printf("%02X ", lidar_rx);
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
 
-        // Optional: new line every 32 bytes (for readability)
-        static int count = 0;
-        if (++count >= 32)
-        {
-            printf("\r\n");
-            count = 0;
-        }
-
-        // Continue receiving
-        HAL_UART_Receive_IT(&huart3, &lidar_rx, 1);
-    }
-}
 /* USER CODE END 0 */
 
 /**
@@ -115,13 +194,16 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART1_UART_Init();
+  MX_USART2_UART_Init();
   MX_USART3_UART_Init();
   /* USER CODE BEGIN 2 */
-  HAL_UART_Receive_IT(&huart3, &lidar_rx, 1);  // LIDAR UART
-  HAL_Delay(200);
+  HAL_UART_Receive_IT(&huart2, &radar_rx, 1); // Radar
+  HAL_UART_Receive_IT(&huart3, &lidar_rx, 1); // Lidar
 
-  uint8_t start_cmd[] = {0xA5,0x20};
-  HAL_UART_Transmit(&huart3, start_cmd, 2, 100);
+  // Start LiDAR scanning
+  HAL_Delay(1000);
+  uint8_t start_scan[] = {0xA5, 0x20};
+  HAL_UART_Transmit(&huart3, start_scan, 2, 100);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -131,6 +213,17 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+	  if (radar_ready)
+	      {
+	          radar_ready = 0;
+	          process_radar();
+	      }
+
+	      if (lidar_ready)
+	      {
+	          lidar_ready = 0;
+	          process_lidar();
+	      }
   }
   /* USER CODE END 3 */
 }
@@ -208,6 +301,39 @@ static void MX_USART1_UART_Init(void)
 }
 
 /**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
   * @brief USART3 Initialization Function
   * @param None
   * @retval None
@@ -252,8 +378,8 @@ static void MX_GPIO_Init(void)
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOD_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
 
 /* USER CODE BEGIN MX_GPIO_Init_2 */
 /* USER CODE END MX_GPIO_Init_2 */
